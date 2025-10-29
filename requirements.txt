@@ -1,0 +1,11 @@
+streamlit
+vnstock
+ta
+backtesting
+deap
+joblib
+scipy
+numpy
+pandas
+matplotlib
+

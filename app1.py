@@ -29,16 +29,25 @@ def fetch_price_history(ticker, start_date, end_date):
     """
     Lấy dữ liệu giá đóng cửa ngày cho 1 mã.
     Trả về DataFrame index=Date, cột 'Close'.
+    Nếu gọi API thất bại (ví dụ bị chặn trên Cloud) -> trả về None thay vì làm app crash.
     """
-    q = Quote(source='vci', symbol=ticker)
-    df = q.history(start=start_date, end=end_date, interval='1D')
+    try:
+        q = Quote(source='vci', symbol=ticker)
+        df = q.history(start=start_date, end=end_date, interval='1D')
+    except Exception as e:
+        # log nhẹ để debug, nhưng đừng kill app
+        print(f"[WARN] fetch_price_history({ticker}) lỗi khi gọi API: {e}")
+        return None
+
     if df is None or df.empty:
+        print(f"[WARN] fetch_price_history({ticker}): API trả về rỗng.")
         return None
 
     df = df[['time', 'close']].rename(columns={'time': 'Date', 'close': 'Close'})
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.set_index('Date').sort_index()
     return df
+
 
 
 def screen_bank_stocks(
@@ -48,11 +57,9 @@ def screen_bank_stocks(
     max_missing_ratio=0.4
 ):
     """
-    Lọc các mã ngân hàng dựa trên tỷ lệ thiếu dữ liệu.
-    - max_missing_ratio = 0.4 => cho phép tối đa 40% ngày bị thiếu.
-    Trả về:
-      summary_df: bảng tình trạng từng mã
-      merged_prices: DataFrame chứa giá Close của các mã đạt điều kiện
+    Quét chất lượng dữ liệu từng mã bank.
+    Nếu API bị chặn => df = None => mã đó sẽ bị đánh dấu NO DATA
+    App vẫn tiếp tục chạy.
     """
     results = []
     price_panel = {}
@@ -94,6 +101,7 @@ def screen_bank_stocks(
         merged_prices = pd.DataFrame()
 
     return summary_df, merged_prices
+
 
 
 # ---------- Bước 2: Tối ưu tỷ trọng ----------
@@ -821,13 +829,17 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "4️⃣ Ensemble + Backtest"
 ])
 
-
 # ============= TAB 1: LỌC CỔ PHIẾU =============
 with tab1:
     st.header("Bước 1. Lọc cổ phiếu ngân hàng đầu vào")
 
+    # Hiển thị đã lưu
     st.markdown("**Các mã đã lưu hiện tại:**")
-    st.write(st.session_state.selected_stocks if len(st.session_state.selected_stocks) > 0 else "Chưa có")
+    st.write(
+        st.session_state.selected_stocks
+        if len(st.session_state.selected_stocks) > 0
+        else "Chưa có"
+    )
 
     universe = st.multiselect(
         "Chọn universe ngân hàng để kiểm tra dữ liệu",
@@ -835,28 +847,59 @@ with tab1:
         default=bank_universe_default
     )
 
+    # nút chạy lọc
     run_screen = st.button("📊 Chạy lọc dữ liệu (Screen)")
 
+    # tạo biến session_state nếu chưa có
     if "last_screen_summary" not in st.session_state:
         st.session_state.last_screen_summary = None
     if "last_good_stocks" not in st.session_state:
         st.session_state.last_good_stocks = []
 
     if run_screen:
-        summary_df, _ = screen_bank_stocks(
-            universe,
-            start_date=train_start_str,
-            end_date=train_end_str,
-            max_missing_ratio=0.4
-        )
-        st.session_state.last_screen_summary = summary_df
-        st.session_state.last_good_stocks = summary_df[summary_df["Status"]=="OK"]["Ticker"].tolist()
+        # Giai đoạn train để đánh giá độ đầy đủ dữ liệu
+        train_start_str = train_start.strftime("%Y-%m-%d")
+        train_end_str   = train_end.strftime("%Y-%m-%d")
 
+        try:
+            summary_df, merged_prices = screen_bank_stocks(
+                universe,
+                start_date=train_start_str,
+                end_date=train_end_str,
+                max_missing_ratio=0.4
+            )
+
+            st.session_state.last_screen_summary = summary_df
+
+            if summary_df is not None and not summary_df.empty:
+                ok_list = summary_df[summary_df["Status"] == "OK"]["Ticker"].tolist()
+            else:
+                ok_list = []
+
+            st.session_state.last_good_stocks = ok_list
+
+            if len(ok_list) == 0:
+                st.warning(
+                    "Không mã nào lấy được dữ liệu (có thể server chứng khoán chặn IP Streamlit Cloud). "
+                    "Bạn vẫn tiếp tục xem luồng chiến lược được nhưng dữ liệu thực tế có thể cần chạy tại máy local."
+                )
+            else:
+                st.success(f"Các mã đạt yêu cầu dữ liệu: {ok_list}")
+
+        except Exception as e:
+            # QUAN TRỌNG: nếu vnstock fail (RetryError) thì ta không crash app
+            st.error(
+                "Không gọi được dữ liệu từ nguồn chứng khoán (có thể bị giới hạn IP Streamlit Cloud). "
+                "Hãy thử chạy lại trên máy local. "
+                f"Chi tiết lỗi: {e}"
+            )
+
+    # Hiển thị lại summary nếu đã có từ lần trước (kể cả sau rerun trang)
     if st.session_state.last_screen_summary is not None:
-        st.subheader("Chất lượng dữ liệu các mã:")
+        st.subheader("Chất lượng dữ liệu các mã (lần quét gần nhất):")
         st.dataframe(st.session_state.last_screen_summary)
-        st.success(f"Các mã đạt yêu cầu dữ liệu: {st.session_state.last_good_stocks}")
 
+        # Cho người dùng chọn mã để lưu cho bước sau
         chosen = st.multiselect(
             "Chọn các mã bạn muốn GIỮ lại cho bước sau",
             options=st.session_state.last_good_stocks,
@@ -868,7 +911,7 @@ with tab1:
             st.session_state.selected_stocks = chosen
             st.success(f"ĐÃ LƯU: {chosen}")
     else:
-        st.info("Bấm nút '📊 Chạy lọc dữ liệu (Screen)' để xem mã nào đạt yêu cầu trước khi lưu.")
+        st.info("Bấm nút '📊 Chạy lọc dữ liệu (Screen)' để kiểm tra chất lượng dữ liệu và chọn mã.")
 
 
 # ============= TAB 2: TỐI ƯU TỶ TRỌNG =============
